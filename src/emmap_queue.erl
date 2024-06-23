@@ -356,6 +356,23 @@ peek(Mem, Init, Fun) when is_function(Fun, 2) ->
   {Head, Tail, _, _} = header(Mem),
   F(Head, Tail, Init).
 
+del(Mem, Fun) when is_function(Fun, 1) ->
+  F = fun
+    G(H, T) when H < T ->
+      {Msg, NextH} = read_first(Mem, H),
+      case Fun(Msg) of
+        false ->
+          G(NextH, T);
+        true ->
+          emmap:pwrite(Mem, H+4, <<0>>)
+      end;
+    G(_, _) ->
+      ok
+  end,
+  {Head, Tail, _, _} = header(Mem),
+  F(Head, Tail).
+
+
 %% @doc Inspect all messages in the queue iteratively in the reverse order by passing 
 %% them to a custom lambda function. The `Fun' takes a message and state and returns a
 %% `{cont, State}' to continue or `{halt, State}' to abort.
@@ -430,7 +447,12 @@ read_first(Mem, Head) ->
   BinSz  = Sz-8,  % The size read is inclusive of the 2 sizes written before/after the msg
   {ok,   <<Bin:BinSz/binary, EndSz:32/integer>>} = emmap:pread(Mem, Head+4, BinSz+4),
   EndSz /= Sz   andalso erlang:error({message_size_mismatch, {Sz, EndSz}, Head}),
-  {binary_to_term(Bin), Head+Sz}.
+  case binary:first(Bin) of
+    0 ->
+      read_first(Mem, Head+Sz);
+    _ ->
+      {binary_to_term(Bin), Head+Sz}
+  end.
  
 read_last(Mem, Head, Tail) when Head < Tail-8 ->
   % Read the size of the next message
@@ -440,7 +462,12 @@ read_last(Mem, Head, Tail) when Head < Tail-8 ->
       BinSz  = Sz-8,  % The size read is inclusive of the 2 sizes written before/after the msg
       case emmap:pread(Mem, I, Sz-4) of
         {ok, <<Sz:32/integer, Bin:BinSz/binary>>} ->
-          {binary_to_term(Bin), I};
+          case binary:first(Bin) of
+            0 ->
+              read_last(Mem, Head, I);
+            _ ->
+              {binary_to_term(Bin), I}
+          end;
         {error, Why} ->
           erlang:error({invalid_msg_header, Why})
       end;
@@ -523,7 +550,15 @@ spsc_queue_test() ->
   ?assert(is_empty(Mem)),
   ?assertEqual(ok,        push(Mem, Term, 1)),
   ?assertEqual(ok,        erase(Mem)),
-  ?assert(is_empty(Mem)).
+  ?assert(is_empty(Mem)),
+
+  ?assertEqual([], [R || R <- [push(Mem, I) || I <- "abcdefgh"], R /= ok]),
+  del(Mem, fun(X) -> X == $c end),
+  ?assertEqual("abdefgh", lists:reverse(peek(Mem, [], fun(I,S) -> {cont, [I | S]} end))),
+  ?assertEqual("abdefgh", rpeek(Mem, [], fun(I,S) -> {cont, [I | S]} end)),
+  ?assertEqual("abdefgh", lists:reverse(pop(Mem, [], fun(I,S) -> {cont, [I | S]} end))),
+  ?assert(is_empty(Mem)),
+  ok.
 
 file_size()             -> file_size(element(2, os:type())).
 file_size(darwin)       -> 2048;
